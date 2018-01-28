@@ -107,7 +107,7 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
     ''' For given VcfRecord, return haplotypes for each sample and 
         summarise sample counts for remaining samples.
     '''
-    calls = []
+    alleles = [] #list of tuples per sample
     if len(var.ALLELES) != 2: #skip non-biallelic
         logger.debug("skipping non-biallelic variant at {}:{}"
                      .format(var.CHROM, var.POS))
@@ -124,13 +124,15 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
     for s in samples:
         if not gt_filter.gt_is_ok(gts, s, 0):
             sample_no_calls += 1
-            calls.append("NoCall")
+            alleles.append(("NoCall", "NoCall"))
+            #calls.append("NoCall")
             continue
         sgt = gts['GT'][s]
         if 1 in sgt:
             sample_with_alt = True
         if len(set(sgt)) == 1: #homozygous
-            calls.append(str.join("|", (str(x) for x in sgt)))
+            #calls.append(str.join("|", (str(x) for x in sgt)))
+            alleles.append( (var.ALLELES[sgt[0]], var.ALLELES[sgt[1]]) )
             allele_in_phase[s] = sgt[0]
             continue
         allele = max(sgt)
@@ -147,7 +149,8 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
             if None in mgt or not gt_filter.gt_is_ok(gts, m, max(mgt)):
                 mgt = ()
         if not fgt and not mgt: #can't phase
-            calls.append(str.join("/", (str(x) for x in sgt)))
+            c = str.join("/", (var.ALLELES[x] for x in sgt))
+            alleles.append( (c,c) )
         else:
             pat = None
             mat = None
@@ -162,7 +165,8 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
             elif mgt:
                 mat = 0
             if mat is None and pat is None:#can't phase
-                calls.append(str.join("/", (str(x) for x in sgt)))
+                c = str.join("/", (var.ALLELES[x] for x in sgt))
+                alleles.append( (c,c) )
                 continue
             elif mat is None:
                 mat = int(pat == 0)
@@ -172,17 +176,20 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                 logger.warning("Apparent de novo variant in {} ".format(s) + 
                                 "for {}:{}-{}/{}".format(var.CHROM, var.POS,
                                                          var.REF, var.ALT))
-                calls.append(str.join("/", (str(x) for x in sgt)))
+                c = str.join("/", (var.ALLELES[x] for x in sgt))
+                alleles.append( (c,c) )
                 continue
             if index_var:
                 if mat == 1 and pat == 0:
                     reverse_allele_order[s] = True
             if reverse_allele_order[s]:
                 allele_in_phase[s] = mat
-                calls.append("{}|{}".format(mat, pat))
+                #calls.append("{}|{}".format(mat, pat))
+                alleles.append( (var.ALLELES[mat], var.ALLELES[pat]) )
             else:
                 allele_in_phase[s] = pat
-                calls.append("{}|{}".format(pat, mat))
+                #calls.append("{}|{}".format(pat, mat))
+                alleles.append( (var.ALLELES[pat], var.ALLELES[mat]) )
     if not sample_with_alt:
         logger.debug("skipping variant without ALT allele in samples at {}:{}"
                      .format(var.CHROM, var.POS))
@@ -210,13 +217,14 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
         if p_allele is not None and p_allele in gts['GT'][s]:
             n_compat += 1
     row = [var.CHROM, var.POS, var.ID, var.REF, var.ALT]
-    if n_in_phase > 1 and p_allele is not None:
+    if n_in_phase and p_allele is not None:
         row.append(var.ALLELES[p_allele])
     else:
         row.append('?')
     row.append(n_in_phase)
     row.append(n_compat)
-    row.extend(calls)
+    for al in alleles:
+        row.extend(al)
     an = 2 * sum(counts.values())
     ac = counts["0/1"] + (2*counts["1/1"])
     af = 0
@@ -330,7 +338,8 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
     index_row.pop() # remove informative only flag
     out_fh.write('#' + str.join(" ", sys.argv) + "\n")
     header_cols = [ "#CHROM", "POS", "ID", "REF", "ALT", "HAP", "N_IN_PHASE", 
-                    "N_COMPAT"] + samples + ["OTHER_N_ALLELES", "ALT_MAF", ]
+                    "N_COMPAT"] + [x + "_Allele_1\t" + x + "_Allele_2"  
+                    for x in samples] + ["OTHER_N_ALLELES", "ALT_MAF", ]
     if gnomad_reader is not None:
         header_cols.extend(["gnomAD_AF", "gnomAD_AF_POPMAX", "POPMAX_pop"])
     out_fh.write(str.join("\t", header_cols) + "\n")
@@ -403,7 +412,7 @@ def search_var(vcf, chrom, pos, ref, alt):
                        .format(chrom, pos, ref, alt))
 
 def get_logger(debug=False, quiet=False):
-    logger = logging.getLogger("vcf_to_hap_table")
+    logger = logging.getLogger("het_hap_phaser")
     if debug:
         logger.setLevel(logging.DEBUG)
     elif quiet:
