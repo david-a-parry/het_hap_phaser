@@ -10,6 +10,7 @@ from parse_vcf import VcfReader, VcfHeader, VcfRecord
 from vase.ped_file import PedFile, Family, Individual, PedError
 from vase.sample_filter import GtFilter
 from vase.gnomad_filter import GnomadFilter 
+from bedfinder import BedFinder
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -46,22 +47,35 @@ def parse_args():
                             help='''Only output sites where the number of 
                                     uncalled or filtered genotypes in samples
                                     does not exceed this value.''')
+    opt_args.add_argument('-a', '--output_alleles', action='store_true',
+                            help='''Output one column per allele (i.e. two 
+                                    columns per sample) rather than one column 
+                                    per sample genotype.''') 
     opt_args.add_argument('-o', '--output',  
                             help='''Filename for tabular output.''')
     opt_args.add_argument('-g', '--gnomad_vcf',  
                             help='''gnomAD/ExAC VCF for reporting allele 
                                     frequencies.''')
-
+    opt_args.add_argument('-y', '--min_other_allele_freq', metavar='FREQ', 
+                            type=float,
+                            help='''Minimum gnomAD/ExAC allele frequency for 
+                                    the non-haplotype allele at a site. If the 
+                                    allele frequency of the non-haplotype 
+                                    allele is greater than this value the 
+                                    variant will be skipped. This can be used 
+                                    to only output sites likely to be 
+                                    informative when genotypes.''')
+    opt_args.add_argument('-x', '--exclude_regions', metavar='BED',
+                            help='''BED file of regions to ignore (e.g. repeat 
+                                    masked regions).''')
     opt_args.add_argument('--gq', type=int, 
                             help='''Minimum genotype quality (GQ) score. 
                                     Genotype calls with lower GQs than this 
                                     will be treated as no-calls.''')
-
     opt_args.add_argument('--dp', type=int, 
                             help='''Minimum genotype depth. Genotype calls with
                                     lower depth than this value will be treated 
                                     as no-calls.''')
-
     opt_args.add_argument('--het_ab', type=float, 
                             help='''Minimum allele balance (0.0-0.5) for an ALT
                                     genotype in a heterozygous call. 
@@ -80,15 +94,30 @@ def parse_args():
                             help='''Output debugging information to STDERR.''')
     return parser
 
-def output_row(row, output, var, gnomad_reader, logger):
+def output_row(row, output, var, gnomad_reader, min_af, logger, samples):
     if gnomad_reader is not None:
         logger.debug("Searching gnomad VCF for {}:{}-{}/{}".format(var.CHROM,
                                                                    var.POS,
                                                                    var.REF,
                                                                    var.ALT))
         af, popmax, pop, = search_gnomad(var, gnomad_reader)
+        if min_af is not None:
+            if row[7] == len(samples): 
+                #if genotype does not refine region only output if above min_af
+                if af == '.': #not in gnomAD so presumably AF is < min_af
+                    logger.debug("Skipping variant due to absence in gnomAD")
+                    return 0
+                if row[5] == var.REF: #haplotype allele is the REF allele
+                    other_af = float(af)
+                else: #haplotype allele is the ALT allele
+                    other_af = 1.0 - float(af)
+                if other_af < min_af:
+                    logger.debug("Skipping variant due to gnomAD AF ({}) < {}"
+                                 .format(other_af, min_af))
+                    return 0
         row.extend([af, popmax, pop])
     output.write(str.join("\t", (str(x) for x in row)) + "\n")
+    return 1
 
 def search_gnomad(var, gnomad_reader):
     hits = gnomad_reader.get_overlapping_records(var)
@@ -102,12 +131,13 @@ def search_gnomad(var, gnomad_reader):
     return ('.', '.', '.')
 
 def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
-                     reverse_allele_order, index_var=False, 
-                     gnomad_reader=None):
+                     reverse_allele_order, output_alleles=False, 
+                     index_var=False, ):
     ''' For given VcfRecord, return haplotypes for each sample and 
         summarise sample counts for remaining samples.
     '''
-    alleles = [] #list of tuples per sample
+    alleles = [] #list of tuples (e.g. ("C", "T")) per sample
+    calls = [] #list of strings (e.g. "C|T") per sample
     if len(var.ALLELES) != 2: #skip non-biallelic
         logger.debug("skipping non-biallelic variant at {}:{}"
                      .format(var.CHROM, var.POS))
@@ -124,14 +154,14 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
     for s in samples:
         if not gt_filter.gt_is_ok(gts, s, 0):
             sample_no_calls += 1
+            calls.append("NoCall")
             alleles.append(("NoCall", "NoCall"))
-            #calls.append("NoCall")
             continue
         sgt = gts['GT'][s]
         if 1 in sgt:
             sample_with_alt = True
         if len(set(sgt)) == 1: #homozygous
-            #calls.append(str.join("|", (str(x) for x in sgt)))
+            calls.append(str.join("|", (var.ALLELES[x] for x in sgt)))
             alleles.append( (var.ALLELES[sgt[0]], var.ALLELES[sgt[1]]) )
             allele_in_phase[s] = sgt[0]
             continue
@@ -150,6 +180,7 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                 mgt = ()
         if not fgt and not mgt: #can't phase
             c = str.join("/", (var.ALLELES[x] for x in sgt))
+            calls.append(c)
             alleles.append( (c,c) )
         else:
             pat = None
@@ -166,6 +197,7 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                 mat = 0
             if mat is None and pat is None:#can't phase
                 c = str.join("/", (var.ALLELES[x] for x in sgt))
+                calls.append(c)
                 alleles.append( (c,c) )
                 continue
             elif mat is None:
@@ -177,6 +209,7 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                                 "for {}:{}-{}/{}".format(var.CHROM, var.POS,
                                                          var.REF, var.ALT))
                 c = str.join("/", (var.ALLELES[x] for x in sgt))
+                calls.append(c)
                 alleles.append( (c,c) )
                 continue
             if index_var:
@@ -184,11 +217,11 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                     reverse_allele_order[s] = True
             if reverse_allele_order[s]:
                 allele_in_phase[s] = mat
-                #calls.append("{}|{}".format(mat, pat))
+                calls.append("{}|{}".format(var.ALLELES[mat], var.ALLELES[pat]))
                 alleles.append( (var.ALLELES[mat], var.ALLELES[pat]) )
             else:
                 allele_in_phase[s] = pat
-                #calls.append("{}|{}".format(pat, mat))
+                calls.append("{}|{}".format(var.ALLELES[pat], var.ALLELES[mat]))
                 alleles.append( (var.ALLELES[pat], var.ALLELES[mat]) )
     if not sample_with_alt:
         logger.debug("skipping variant without ALT allele in samples at {}:{}"
@@ -223,8 +256,11 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
         row.append('?')
     row.append(n_in_phase)
     row.append(n_compat)
-    for al in alleles:
-        row.extend(al)
+    if output_alleles:
+        for al in alleles:
+            row.extend(al)
+    else:
+        row.extend(calls)
     an = 2 * sum(counts.values())
     ac = counts["0/1"] + (2*counts["1/1"])
     af = 0
@@ -246,7 +282,8 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
 def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None, 
                gnomad_vcf=None, gq=0, dp=0, het_ab=0., hom_ab=0., 
                informative_only=False, phased_in_all=False, max_no_calls=None,
-               quiet=False, debug=False):
+               output_alleles=False, quiet=False, debug=False,
+               min_other_allele_freq=None, exclude_regions=None,):
     ''' 
         Find biallelics SNVs either side of variant and output a 
         haplotype table listing haplotypes in each sample.
@@ -308,6 +345,10 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
     families = set()
     unrelateds = []
     reverse_allele_order = defaultdict(bool)
+    if exclude_regions is not None:
+        bfinder = BedFinder(exclude_regions)
+    else:
+        bfinder = None
     for s in samples:
         if s not in vreader.header.samples:
             raise RuntimeError("ERROR: Sample '{}' is not in VCF file!"
@@ -331,15 +372,18 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                                                        len(index_var.ALLELES)))
     index_row = parse_haplotypes(index_var, samples, unrelateds,  ped_file, 
                                  gt_filter, logger, reverse_allele_order, 
-                                 True, gnomad_reader)
+                                 index_var=True)
     index_row[2] += "|INDEX"
     index_row.pop() # remove N NoCalls
     index_row.pop() # remove phased in all flag
     index_row.pop() # remove informative only flag
     out_fh.write('#' + str.join(" ", sys.argv) + "\n")
-    header_cols = [ "#CHROM", "POS", "ID", "REF", "ALT", "HAP", "N_IN_PHASE", 
-                    "N_COMPAT"] + [x + "_Allele_1\t" + x + "_Allele_2"  
-                    for x in samples] + ["OTHER_N_ALLELES", "ALT_MAF", ]
+    if output_alleles:
+        sample_cols = [x + "_Allele_1\t" + x + "_Allele_2"  for x in samples] 
+    else:
+        sample_cols = samples 
+    header_cols = ["#CHROM", "POS", "ID", "REF", "ALT", "HAP", "N_IN_PHASE", 
+                   "N_COMPAT"] + sample_cols + ["OTHER_N_ALLELES", "ALT_MAF",]
     if gnomad_reader is not None:
         header_cols.extend(["gnomAD_AF", "gnomAD_AF_POPMAX", "POPMAX_pop"])
     out_fh.write(str.join("\t", header_cols) + "\n")
@@ -347,19 +391,28 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
     end   = int(v_pos)  - 1
     parse_region(vreader, samples, unrelateds, ped_file, v_chrom, start, end, 
                  out_fh, gt_filter, logger, reverse_allele_order, 
-                 informative_only, phased_in_all, max_no_calls, gnomad_reader)
-    output_row(index_row, out_fh, index_var, gnomad_reader, logger)
+                 informative_only, phased_in_all, avoid_bed=bfinder,
+                 output_alleles=output_alleles, max_no_calls=max_no_calls, 
+                 gnomad_reader=gnomad_reader, 
+                 min_other_allele_freq=min_other_allele_freq)
+    _foo = output_row(index_row, out_fh, index_var, gnomad_reader, None, 
+                      logger, None)
     start = int(v_pos) + 1
     end   = int(v_pos) + flanks
     parse_region(vreader, samples, unrelateds, ped_file, v_chrom, start, end, 
                  out_fh, gt_filter, logger, reverse_allele_order, 
-                 informative_only, phased_in_all, max_no_calls, gnomad_reader)
+                 informative_only, phased_in_all, avoid_bed=bfinder,
+                 output_alleles=output_alleles, max_no_calls=max_no_calls, 
+                 gnomad_reader=gnomad_reader, 
+                 min_other_allele_freq=min_other_allele_freq)
     if output is not None:
         out_fh.close()
 
 def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output, 
                  gt_filter, logger, reverse_alleles, informative_only, 
-                 phased_in_all, max_no_calls=None, gnomad_reader=None):
+                 phased_in_all, output_alleles=False, max_no_calls=None, 
+                 gnomad_reader=None, avoid_bed=None, 
+                 min_other_allele_freq=None):
     logger.info("Searching for variants in region {}:{:,}-{:,}".format(
                                                             chrom, start, end))
     vcf.set_region(chrom, start - 1, end)
@@ -369,8 +422,14 @@ def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output,
         if n % 100 == 0 and n != 0:
             logger.info("Parsed {} variants, wrote {}, at {}:{}"
                         .format(n, w, var.CHROM, var.POS))
+        if avoid_bed is not None:
+            if avoid_bed.fetch(var.CHROM, var.POS, var.SPAN):
+                n += 1
+                logger.debug("Variant at {}:{:,} overlaps exclude BED - " + 
+                             "skipping".format(var.CHROM, var.POS))
+                continue
         row = parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, 
-                               logger, reverse_alleles, False, gnomad_reader)
+                               logger, reverse_alleles, output_alleles, False)
         if row is not None:
             no_calls = row.pop()
             all_phased = row.pop()
@@ -382,21 +441,21 @@ def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output,
                 continue
             if phased_in_all:
                 if all_phased:
-                    output_row(row, output, var, gnomad_reader, logger)
-                    w += 1
+                    w += output_row(row, output, var, gnomad_reader, 
+                               min_other_allele_freq, logger, samples)
                 else:
                     logger.debug("Skipping {}:{} due to not all samples phased"
                                  .format(row[0], row[1]))
             elif informative_only:
                 if informative:
-                    output_row(row, output, var, gnomad_reader, logger)
-                    w += 1
+                    w += output_row(row, output, var, gnomad_reader, 
+                               min_other_allele_freq, logger, samples)
                 else:
                     logger.debug("Skipping {}:{} due to not informative"
                                  .format(row[0], row[1]))
             else:
-                output_row(row, output, var, gnomad_reader, logger)
-                w += 1
+                w += output_row(row, output, var, gnomad_reader,
+                           min_other_allele_freq, logger, samples)
         n += 1
 
 def search_var(vcf, chrom, pos, ref, alt):
@@ -438,7 +497,6 @@ def get_output(output):
         Return an output filehandle. If no output specified return 
         sys.stdout.
     '''
-
     if isinstance(output, str):
         fh = open(output, 'w')
     else:
