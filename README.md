@@ -5,8 +5,6 @@ heterozygous variant where at least one parent is available per sample of
 interest. It takes joint-called VCF files as input and produces a tab-delimited 
 table of variants, phased genotypes and proposed haplotype associated with the 
 allele of interest.
-
-This is currently in alpha.
                        
 ## REQUIREMENTS
 
@@ -14,9 +12,21 @@ This is written in python and requires python 3 to run. In addition, the
 following python modules are required:
 
 * VASE:         https://github.com/gantzgraf/vase.git
-    
+
+* bedfinder     https://github.com/gantzgraf/bedfinder.git
+
 * parse_vcf:    installable with pip and should be installed automatically when
                 following the VASE installation instructions.
+
+To quickly install these modules run:
+
+    pip3 install git+git://github.com/gantzgraf/bedfinder.git 
+    pip3 install git+git://github.com/gantzgraf/vase.git    
+
+To download and run this script to get usage information run:
+
+    git clone https://github.com/gantzgraf/het_hap_phaser.git
+    python3 het_hap_phaser/het_hap_phaser.py -h
 
 ## AUTHOR
 
