@@ -173,6 +173,11 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
             alleles.append(("NoCall", "NoCall"))
             continue
         sgt = gts['GT'][s]
+        if len(set(sgt)) == 1 and None in sgt:
+            sample_no_calls.add(s)
+            calls.append("NoCall")
+            alleles.append(("NoCall", "NoCall"))
+            continue
         if 1 in sgt:
             sample_with_alt = True
         if len(set(sgt)) == 1: #homozygous
