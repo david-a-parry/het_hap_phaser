@@ -53,9 +53,13 @@ def parse_args():
                                     per sample genotype.''') 
     opt_args.add_argument('-o', '--output',  
                             help='''Filename for tabular output.''')
-    opt_args.add_argument('-g', '--gnomad_vcf',  
-                            help='''gnomAD/ExAC VCF for reporting allele 
+    opt_args.add_argument('-g', '--gnomad_vcf',  nargs='+',
+                            help='''gnomAD/ExAC VCFs for reporting allele 
                                     frequencies.''')
+    opt_args.add_argument('-gnomad_pop', '--gnomad_pop', metavar='POP', 
+                            help='''Report gnomAD/ExAC frequencies for this 
+                                    population. Default is to report POPMAX.
+                          ''')
     opt_args.add_argument('-y', '--min_other_allele_freq', metavar='FREQ', 
                             type=float,
                             help='''Minimum gnomAD/ExAC allele frequency for 
@@ -94,40 +98,51 @@ def parse_args():
                             help='''Output debugging information to STDERR.''')
     return parser
 
-def output_row(row, output, var, gnomad_reader, min_af, logger, samples):
-    if gnomad_reader is not None:
+def output_row(row, output, var, gnomad_readers, min_af, logger, samples, 
+               gnomad_pop='POPMAX'):
+    if gnomad_readers:
         logger.debug("Searching gnomad VCF for {}:{}-{}/{}".format(var.CHROM,
                                                                    var.POS,
                                                                    var.REF,
                                                                    var.ALT))
-        af, popmax, pop, = search_gnomad(var, gnomad_reader)
-        if min_af is not None:
-            if row[7] == len(samples): 
-                #if genotype does not refine region only output if above min_af
-                if af == '.': #not in gnomAD so presumably AF is < min_af
-                    logger.debug("Skipping variant due to absence in gnomAD")
-                    return 0
-                if row[5] == var.REF: #haplotype allele is the REF allele
-                    other_af = float(af)
-                else: #haplotype allele is the ALT allele
-                    other_af = 1.0 - float(af)
-                if other_af < min_af:
-                    logger.debug("Skipping variant due to gnomAD AF ({}) < {}"
-                                 .format(other_af, min_af))
-                    return 0
-        row.extend([af, popmax, pop])
+        max_af, max_popmax, max_pop = '.', '.', '.'
+        for reader in gnomad_readers:
+            af, popmax, pop, = search_gnomad(var, reader, gnomad_pop)
+            if min_af is not None:
+                if row[7] == len(samples): 
+                    #if genotype does not refine region only output if above min_af
+                    if af == '.': 
+                        if row[5] == var.REF:
+                            #not in gnomAD so presumably ALT AF is < min_af
+                            logger.debug("Skipping variant due to absence in " +
+                                         "gnomAD and haplotype is REF")
+                            return 0
+                        else:
+                            other_af = 1.0
+                    elif row[5] == var.REF: #haplotype allele is the REF allele
+                        other_af = float(af)
+                    else: #haplotype allele is the ALT allele
+                        other_af = 1.0 - float(af)
+                    if other_af < min_af:
+                        logger.debug("Skipping variant due to gnomAD AF ({}) < {}"
+                                     .format(other_af, min_af))
+                        return 0
+            if af != '.':
+                if max_af == '.' or max_af < af:
+                    max_af, max_popmax, max_pop = af, popmax, pop
+        row.extend([max_af, max_popmax, max_pop])
     output.write(str.join("\t", (str(x) for x in row)) + "\n")
     return 1
 
-def search_gnomad(var, gnomad_reader):
+def search_gnomad(var, gnomad_reader, pop='POPMAX'):
     hits = gnomad_reader.get_overlapping_records(var)
     for h in hits:
         for i in range(len(h.DECOMPOSED_ALLELES)):
             if var.DECOMPOSED_ALLELES[0] == h.DECOMPOSED_ALLELES[i]:
                 af = h.INFO_FIELDS['AF'].split(',')[i]
-                popmax = h.INFO_FIELDS['AF_POPMAX'].split(',')[i]
-                pop = h.INFO_FIELDS['POPMAX'].split(',')[i]
-                return (af, popmax, pop)
+                p_af = h.INFO_FIELDS['AF_'+ pop].split(',')[i]
+                popmax = h.INFO_FIELDS['POPMAX'].split(',')[i]
+                return (af, p_af, popmax)
     return ('.', '.', '.')
 
 def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
@@ -150,10 +165,10 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
     gts = var.parsed_gts(fields=gt_filter.fields)
     sample_with_alt = False
     allele_in_phase = dict()
-    sample_no_calls = 0
+    sample_no_calls = set()
     for s in samples:
         if not gt_filter.gt_is_ok(gts, s, 0):
-            sample_no_calls += 1
+            sample_no_calls.add(s)
             calls.append("NoCall")
             alleles.append(("NoCall", "NoCall"))
             continue
@@ -247,8 +262,9 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
         n_compat = n_in_phase
     for s in (x for x in samples if x not in allele_in_phase):
         #check for compatible gts in unphased samples
-        if p_allele is not None and p_allele in gts['GT'][s]:
-            n_compat += 1
+        if p_allele is not None:
+            if p_allele in gts['GT'][s] or s in sample_no_calls:
+                n_compat += 1
     row = [var.CHROM, var.POS, var.ID, var.REF, var.ALT]
     if n_in_phase and p_allele is not None:
         row.append(var.ALLELES[p_allele])
@@ -276,14 +292,15 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
         row.append(True)
     else: 
         row.append(False)
-    row.append(sample_no_calls)
+    row.append(len(sample_no_calls))
     return row
 
 def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None, 
-               gnomad_vcf=None, gq=0, dp=0, het_ab=0., hom_ab=0., 
+               gnomad_vcf=[], gq=0, dp=0, het_ab=0., hom_ab=0., 
                informative_only=False, phased_in_all=False, max_no_calls=None,
                output_alleles=False, quiet=False, debug=False,
-               min_other_allele_freq=None, exclude_regions=None,):
+               min_other_allele_freq=None, exclude_regions=None, 
+               gnomad_pop='POPMAX'):
     ''' 
         Find biallelics SNVs either side of variant and output a 
         haplotype table listing haplotypes in each sample.
@@ -327,6 +344,10 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
             gnomad_vcf:
                     Optional gnomAD/ExAC VCF for reporting allele 
                     frequencies.
+    
+            gnomad_pop:
+                    Optional gnomAD/ExAC population to report AF from. Default
+                    is to always report POPMAX.
 
             informative_only:
                     Only output variants phased in at least one sample.
@@ -341,7 +362,7 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
     v_chrom, v_pos, v_ref, v_alt = parse_var_string(variant)
     v_pos = int(v_pos)
     out_fh = get_output(output)
-    gnomad_reader = get_gnomad_reader(gnomad_vcf)
+    gnomad_readers = get_gnomad_readers(gnomad_vcf)
     families = set()
     unrelateds = []
     reverse_allele_order = defaultdict(bool)
@@ -363,7 +384,7 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
         elif ped_file.individuals[s].fid not in families:
             unrelateds.append(s)
             families.add(ped_file.individuals[s].fid)
-    gt_filter = GtFilter(vcf, gq=gq, dp=dp, het_ab=het_ab, hom_ab=hom_ab)
+    gt_filter = GtFilter(vreader, gq=gq, dp=dp, het_ab=het_ab, hom_ab=hom_ab)
     logger.info("Searching input VCF for {}".format(variant))
     index_var = search_var(vreader, v_chrom, v_pos, v_ref, v_alt)
     if len(index_var.ALLELES) != 2:
@@ -384,7 +405,7 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
         sample_cols = samples 
     header_cols = ["#CHROM", "POS", "ID", "REF", "ALT", "HAP", "N_IN_PHASE", 
                    "N_COMPAT"] + sample_cols + ["OTHER_N_ALLELES", "ALT_MAF",]
-    if gnomad_reader is not None:
+    if gnomad_readers:
         header_cols.extend(["gnomAD_AF", "gnomAD_AF_POPMAX", "POPMAX_pop"])
     out_fh.write(str.join("\t", header_cols) + "\n")
     start = int(v_pos) - flanks if flanks < v_pos else 1
@@ -393,26 +414,28 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                  out_fh, gt_filter, logger, reverse_allele_order, 
                  informative_only, phased_in_all, avoid_bed=bfinder,
                  output_alleles=output_alleles, max_no_calls=max_no_calls, 
-                 gnomad_reader=gnomad_reader, 
-                 min_other_allele_freq=min_other_allele_freq)
-    _foo = output_row(index_row, out_fh, index_var, gnomad_reader, None, 
-                      logger, None)
+                 gnomad_readers=gnomad_readers, 
+                 min_other_allele_freq=min_other_allele_freq,
+                 gnomad_pop=gnomad_pop)
+    _foo = output_row(index_row, out_fh, index_var, gnomad_readers, None, 
+                      logger, None, gnomad_pop)
     start = int(v_pos) + 1
     end   = int(v_pos) + flanks
     parse_region(vreader, samples, unrelateds, ped_file, v_chrom, start, end, 
                  out_fh, gt_filter, logger, reverse_allele_order, 
                  informative_only, phased_in_all, avoid_bed=bfinder,
                  output_alleles=output_alleles, max_no_calls=max_no_calls, 
-                 gnomad_reader=gnomad_reader, 
-                 min_other_allele_freq=min_other_allele_freq)
+                 gnomad_readers=gnomad_readers, 
+                 min_other_allele_freq=min_other_allele_freq, 
+                 gnomad_pop=gnomad_pop)
     if output is not None:
         out_fh.close()
 
 def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output, 
                  gt_filter, logger, reverse_alleles, informative_only, 
                  phased_in_all, output_alleles=False, max_no_calls=None, 
-                 gnomad_reader=None, avoid_bed=None, 
-                 min_other_allele_freq=None):
+                 gnomad_readers=[], avoid_bed=None, 
+                 min_other_allele_freq=None, gnomad_pop='POPMAX'):
     logger.info("Searching for variants in region {}:{:,}-{:,}".format(
                                                             chrom, start, end))
     vcf.set_region(chrom, start - 1, end)
@@ -441,21 +464,24 @@ def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output,
                 continue
             if phased_in_all:
                 if all_phased:
-                    w += output_row(row, output, var, gnomad_reader, 
-                               min_other_allele_freq, logger, samples)
+                    w += output_row(row, output, var, gnomad_readers, 
+                               min_other_allele_freq, logger, samples, 
+                               gnomad_pop)
                 else:
                     logger.debug("Skipping {}:{} due to not all samples phased"
                                  .format(row[0], row[1]))
             elif informative_only:
                 if informative:
-                    w += output_row(row, output, var, gnomad_reader, 
-                               min_other_allele_freq, logger, samples)
+                    w += output_row(row, output, var, gnomad_readers, 
+                               min_other_allele_freq, logger, samples,
+                               gnomad_pop)
                 else:
                     logger.debug("Skipping {}:{} due to not informative"
                                  .format(row[0], row[1]))
             else:
-                w += output_row(row, output, var, gnomad_reader,
-                           min_other_allele_freq, logger, samples)
+                w += output_row(row, output, var, gnomad_readers,
+                                min_other_allele_freq, logger, samples,
+                                gnomad_pop)
         n += 1
 
 def search_var(vcf, chrom, pos, ref, alt):
@@ -486,11 +512,12 @@ def get_logger(debug=False, quiet=False):
     logger.addHandler(ch)
     return logger
 
-def get_gnomad_reader(vcf):
-    if vcf is None:
-        return None
-    else:
-        return GnomadFilter(vcf, "gnomAD")
+def get_gnomad_readers(vcfs):
+    readers = []
+    if vcfs is not None:
+        for vcf in vcfs:
+            readers.append(GnomadFilter(vcf, "gnomAD"))
+    return readers
 
 def get_output(output):
     ''' 
