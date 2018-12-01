@@ -87,6 +87,11 @@ def parse_args():
                                     genotype in a homozygous call. Homozygous 
                                     calls with an ALT allele balance lower than
                                     this value will be treated as no-calls.''')
+    opt_args.add_argument('--others_to_phase', nargs='+', default=[],
+                            help='''Samples to phase genotypes for but not used
+                                    for calculating haplotypes. Alleles will be
+                                    phased with paternal allele first and
+                                    maternal allele second.''')
     opt_args.add_argument('--quiet', action='store_true', 
                             help='''Do not output progress information to 
                                     STDERR.''')
@@ -132,7 +137,7 @@ def search_gnomad(var, gnomad_reader):
 
 def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
                      reverse_allele_order, output_alleles=False, 
-                     index_var=False, ):
+                     index_var=False, others_to_phase=[]):
     ''' For given VcfRecord, return haplotypes for each sample and 
         summarise sample counts for remaining samples.
     '''
@@ -232,6 +237,68 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
             gt_filter.gt_is_ok(gts, u, max(gts['GT'][u]))):
             #genotype is called and passes GQ/DP/AB criteria
             counts[str.join("/", (str(x) for x in sorted(gts['GT'][u])))] += 1
+    for s in others_to_phase:
+        #samples that we want to phase but do not contribute to haplotype
+        if not gt_filter.gt_is_ok(gts, s, 0):
+            sample_no_calls += 1
+            calls.append("NoCall")
+            alleles.append(("NoCall", "NoCall"))
+            continue
+        sgt = gts['GT'][s]
+        if len(set(sgt)) == 1: #homozygous
+            calls.append(str.join("|", (var.ALLELES[x] for x in sgt)))
+            alleles.append( (var.ALLELES[sgt[0]], var.ALLELES[sgt[1]]) )
+            allele_in_phase[s] = sgt[0]
+            continue
+        fgt = ()
+        mgt = ()
+        f = ped_file.individuals[s].father
+        m = ped_file.individuals[s].mother
+        if f is not None:
+            fgt = gts['GT'][f]
+            if None in fgt or not gt_filter.gt_is_ok(gts, f, max(fgt)):
+                fgt = ()
+        if m is not None:
+            mgt = gts['GT'][m]
+            if None in mgt or not gt_filter.gt_is_ok(gts, m, max(mgt)):
+                mgt = ()
+        if not fgt and not mgt: #can't phase
+            c = str.join("/", (var.ALLELES[x] for x in sgt))
+            calls.append(c)
+            alleles.append( (c,c) )
+        else:
+            pat = None
+            mat = None
+            if 1 in fgt:
+                if 0 not in fgt or 1 not in mgt and mgt:#allele 1 inherited from father
+                    pat = 1
+            elif fgt:
+                pat = 0
+            if 1 in mgt:
+                if 0 not in mgt or 1 not in fgt and fgt:#allele 1 inherited from mother
+                    mat = 1
+            elif mgt:
+                mat = 0
+            if mat is None and pat is None:#can't phase
+                c = str.join("/", (var.ALLELES[x] for x in sgt))
+                calls.append(c)
+                alleles.append( (c,c) )
+                continue
+            elif mat is None:
+                mat = int(pat == 0)
+            elif pat is None:
+                pat = int(mat == 0)
+            if mat == pat:
+                logger.warning("Apparent de novo variant in {} ".format(s) + 
+                                "for {}:{}-{}/{}".format(var.CHROM, var.POS,
+                                                         var.REF, var.ALT))
+                c = str.join("/", (var.ALLELES[x] for x in sgt))
+                calls.append(c)
+                alleles.append( (c,c) )
+            else:
+                #we are not phasing these samples with index variant
+                calls.append("{}|{}".format(var.ALLELES[pat], var.ALLELES[mat]))
+                alleles.append( (var.ALLELES[pat], var.ALLELES[mat]) )
     phased = list(allele_in_phase.values())
     n_in_phase = 0
     n_compat = 0
@@ -283,7 +350,8 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                gnomad_vcf=None, gq=0, dp=0, het_ab=0., hom_ab=0., 
                informative_only=False, phased_in_all=False, max_no_calls=None,
                output_alleles=False, quiet=False, debug=False,
-               min_other_allele_freq=None, exclude_regions=None,):
+               min_other_allele_freq=None, exclude_regions=None,
+               others_to_phase=[]):
     ''' 
         Find biallelics SNVs either side of variant and output a 
         haplotype table listing haplotypes in each sample.
@@ -334,6 +402,11 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
             phased_in_all:
                     Only output variants phased in ALL samples.
 
+            others_to_phase:
+                    Phase genotypes for these samples but do not include use to
+                    identify haplotype. Alleles will be phased with the
+                    paternal allele first.
+
     '''
     logger = get_logger(debug, quiet)
     vreader = VcfReader(vcf)
@@ -349,7 +422,7 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
         bfinder = BedFinder(exclude_regions)
     else:
         bfinder = None
-    for s in samples:
+    for s in samples + others_to_phase:
         if s not in vreader.header.samples:
             raise RuntimeError("ERROR: Sample '{}' is not in VCF file!"
                                .format(s))
@@ -372,7 +445,8 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                                                        len(index_var.ALLELES)))
     index_row = parse_haplotypes(index_var, samples, unrelateds,  ped_file, 
                                  gt_filter, logger, reverse_allele_order, 
-                                 index_var=True)
+                                 index_var=True,
+                                 others_to_phase=others_to_phase)
     index_row[2] += "|INDEX"
     index_row.pop() # remove N NoCalls
     index_row.pop() # remove phased in all flag
@@ -394,7 +468,8 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                  informative_only, phased_in_all, avoid_bed=bfinder,
                  output_alleles=output_alleles, max_no_calls=max_no_calls, 
                  gnomad_reader=gnomad_reader, 
-                 min_other_allele_freq=min_other_allele_freq)
+                 min_other_allele_freq=min_other_allele_freq,
+                 others_to_phase=others_to_phase)
     _foo = output_row(index_row, out_fh, index_var, gnomad_reader, None, 
                       logger, None)
     start = int(v_pos) + 1
@@ -404,7 +479,8 @@ def vcf_to_hap(vcf, samples, ped, variant, flanks=1e6, output=None,
                  informative_only, phased_in_all, avoid_bed=bfinder,
                  output_alleles=output_alleles, max_no_calls=max_no_calls, 
                  gnomad_reader=gnomad_reader, 
-                 min_other_allele_freq=min_other_allele_freq)
+                 min_other_allele_freq=min_other_allele_freq,
+                 others_to_phase=others_to_phase)
     if output is not None:
         out_fh.close()
 
@@ -412,7 +488,7 @@ def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output,
                  gt_filter, logger, reverse_alleles, informative_only, 
                  phased_in_all, output_alleles=False, max_no_calls=None, 
                  gnomad_reader=None, avoid_bed=None, 
-                 min_other_allele_freq=None):
+                 min_other_allele_freq=None, others_to_phase=[]):
     logger.info("Searching for variants in region {}:{:,}-{:,}".format(
                                                             chrom, start, end))
     vcf.set_region(chrom, start - 1, end)
@@ -429,7 +505,8 @@ def parse_region(vcf, samples, unrelateds, ped_file, chrom, start, end, output,
                              "skipping".format(var.CHROM, var.POS))
                 continue
         row = parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, 
-                               logger, reverse_alleles, output_alleles, False)
+                               logger, reverse_alleles, output_alleles, False,
+                               others_to_phase=others_to_phase)
         if row is not None:
             no_calls = row.pop()
             all_phased = row.pop()
