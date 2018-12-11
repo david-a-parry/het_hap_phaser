@@ -56,8 +56,9 @@ def parse_args():
     opt_args.add_argument('-g', '--gnomad_vcf',  nargs='+',
                             help='''gnomAD/ExAC VCFs for reporting allele 
                                     frequencies.''')
-    opt_args.add_argument('-gnomad_pop', '--gnomad_pop', metavar='POP', 
-                            help='''Report gnomAD/ExAC frequencies for this 
+    opt_args.add_argument('-gnomad_pop', '--gnomad_pop', metavar='POP',
+                          default='POPMAX',
+                            help='''Report gnomAD/ExAC frequencies for this
                                     population. Default is to report POPMAX.
                           ''')
     opt_args.add_argument('-y', '--min_other_allele_freq', metavar='FREQ', 
@@ -167,7 +168,8 @@ def parse_haplotypes(var, samples, unrelateds, ped_file, gt_filter, logger,
     allele_in_phase = dict()
     sample_no_calls = set()
     for s in samples:
-        if not gt_filter.gt_is_ok(gts, s, 0):
+        if not gt_filter.gt_is_ok(gts, s, 0) or not gt_filter.gt_is_ok(gts, s,
+                                                                       1):
             sample_no_calls.add(s)
             calls.append("NoCall")
             alleles.append(("NoCall", "NoCall"))
